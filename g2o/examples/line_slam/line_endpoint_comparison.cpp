@@ -732,16 +732,15 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose) {
 
     // data.poses[i] 是 T_wc (相机在世界中的位姿)
     // SE3Quat 需要 T_cw = T_wc^(-1)
-    // 使用与方案A相同的预生成噪声
-    Isometry3d T_wc_noisy = data.poses[i] * data.pose_noises[i];
-    Isometry3d T_cw = T_wc_noisy.inverse();
+    // 使用真值位姿（固定所有位姿，只优化端点）
+    Isometry3d T_cw = data.poses[i].inverse();
 
     v->setEstimate(SE3Quat(T_cw.rotation(), T_cw.translation()));
+    v->setFixed(true);  // 固定所有位姿
 
     optimizer.addVertex(v);
     pose_vertices[i] = v;
   }
-  pose_vertices[0]->setFixed(true);
 
   // 添加里程计边 (EdgeSE3Expmap)
   for (size_t i = 1; i < data.poses.size(); ++i) {
@@ -815,6 +814,16 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose) {
     optimizer.addEdge(e);
   }
 
+  // 打印端点的初始状态
+  cout << "\n端点的初始状态 vs 真值:" << endl;
+  for (size_t i = 0; i < data.lines.size(); ++i) {
+    Vector3d p1_est = endpoint_vertices[i].first->estimate();
+    Vector3d p2_est = endpoint_vertices[i].second->estimate();
+    double err1 = (data.lines[i].first - p1_est).norm();
+    double err2 = (data.lines[i].second - p2_est).norm();
+    cout << "  线 " << i << ": 端点1误差=" << err1 << "m, 端点2误差=" << err2 << "m" << endl;
+  }
+
   // 优化
   optimizer.initializeOptimization();
   optimizer.computeActiveErrors();
@@ -830,43 +839,33 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose) {
   double time_ms =
       chrono::duration<double, milli>(end_time - start_time).count();
 
-  // 计算误差
-  double total_trans = 0, total_rot = 0;
-  int pose_count = 0;
-
-  for (size_t i = 0; i < data.poses.size(); ++i) {
-    if (pose_vertices[i]->fixed()) continue;
-
-    // SE3Quat 存储的是 T_cw，需要转回 T_wc 来比较
-    SE3Quat est_cw = pose_vertices[i]->estimate();
-    Isometry3d est_wc = Isometry3d::Identity();
-    est_wc.linear() = est_cw.rotation().toRotationMatrix().transpose();
-    est_wc.translation() = -est_wc.linear() * est_cw.translation();
-
-    Isometry3d error = data.poses[i].inverse() * est_wc;
-    total_trans += error.translation().norm();
-    AngleAxisd aa(error.rotation());
-    total_rot += abs(aa.angle());
-    pose_count++;
-  }
-
   // 计算端点误差
   double total_endpoint_error = 0;
+  cout << "\n端点的最终状态 vs 真值:" << endl;
   for (size_t i = 0; i < data.lines.size(); ++i) {
     Vector3d p1_est = endpoint_vertices[i].first->estimate();
     Vector3d p2_est = endpoint_vertices[i].second->estimate();
 
     double err1 = (data.lines[i].first - p1_est).norm();
     double err2 = (data.lines[i].second - p2_est).norm();
-    total_endpoint_error += (err1 + err2) / 2.0;
+    double avg_err = (err1 + err2) / 2.0;
+    total_endpoint_error += avg_err;
+
+    cout << "  线 " << i << ": 端点1误差=" << err1 << "m, 端点2误差=" << err2 << "m";
+    if (avg_err < 0.1) {
+      cout << " [收敛]";
+    } else {
+      cout << " [未收敛]";
+    }
+    cout << endl;
   }
 
   ExperimentResult result;
   result.method_name = "端点+点到线距离";
   result.chi2_before = chi2_before;
   result.chi2_after = chi2_after;
-  result.avg_trans_error = total_trans / pose_count;
-  result.avg_rot_error = (total_rot / pose_count) * 180.0 / M_PI;
+  result.avg_trans_error = total_endpoint_error / data.lines.size();  // 用端点误差
+  result.avg_rot_error = 0;
   result.avg_line_error = total_endpoint_error / data.lines.size();
   result.num_features = data.lines.size() * 2;
   result.num_observations = data.observations.size();  // 每个观测2个约束
