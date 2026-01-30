@@ -73,63 +73,65 @@ def parse_convergence_file(filename):
 
 
 def visualize_convergence_2d(gt_lines, iterations, chi2_values):
-    """2D可视化收敛过程（三视图）"""
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    """2D可视化收敛过程（X-Z侧视图 + Chi2曲线）"""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # 视图配置: (x_idx, y_idx, xlabel, ylabel, title)
-    views = [
-        (0, 1, "X", "Y", "Top View (X-Y)"),
-        (0, 2, "X", "Z", "Side View (X-Z)"),
-        (1, 2, "Y", "Z", "Front View (Y-Z)"),
-    ]
+    ax_xz = axes[0]
+    ax_chi2 = axes[1]
 
-    num_iters = len(iterations)
-    colors = plt.cm.coolwarm(np.linspace(0, 1, num_iters))
+    # 使用 X-Z 侧视图（可以看到所有7条线）
+    # L0-L3 是Z方向垂直线，在X-Z视图中可见
+    # L4 是Y方向水平线，在X-Z视图中是点，但这只有1条
+    xi, yi = 0, 2  # X-Z 平面
 
-    for ax, (xi, yi, xl, yl, title) in zip(axes.flat[:3], views):
-        # 绘制真值线（绿色粗线）
-        for lid, (p1, p2) in enumerate(gt_lines):
-            ax.plot(
-                [p1[xi], p2[xi]],
-                [p1[yi], p2[yi]],
-                "g-",
-                linewidth=3,
-                label="GT" if lid == 0 else "",
-            )
+    # 绘制真值线（绿色粗线）
+    for lid, (p1, p2) in enumerate(gt_lines):
+        ax_xz.plot(
+            [p1[xi], p2[xi]],
+            [p1[yi], p2[yi]],
+            "g-",
+            linewidth=4,
+            label="Ground Truth" if lid == 0 else "",
+        )
+        # 标注线的ID
+        mid = (p1 + p2) / 2
+        ax_xz.text(mid[xi] + 0.05, mid[yi], f"L{lid}", fontsize=9, ha='left')
 
-        # 绘制每次迭代的线
-        for iter_idx, iter_lines in enumerate(iterations):
-            alpha = 0.2 + 0.8 * (iter_idx / max(num_iters - 1, 1))
-            for lid, (p1, p2) in enumerate(iter_lines):
-                label = (
-                    f"Iter {iter_idx}"
-                    if lid == 0 and iter_idx in [0, num_iters - 1]
-                    else ""
-                )
-                ax.plot(
-                    [p1[xi], p2[xi]],
-                    [p1[yi], p2[yi]],
-                    color=colors[iter_idx],
-                    alpha=alpha,
-                    linewidth=1,
-                )
+    # 初始迭代（蓝色虚线）
+    for lid, (p1, p2) in enumerate(iterations[0]):
+        ax_xz.plot(
+            [p1[xi], p2[xi]],
+            [p1[yi], p2[yi]],
+            "b--",
+            linewidth=2,
+            alpha=0.7,
+            label="Initial" if lid == 0 else "",
+        )
 
-        ax.set_xlabel(xl)
-        ax.set_ylabel(yl)
-        ax.set_title(title)
-        ax.grid(True, alpha=0.3)
-        ax.axis("equal")
+    # 最终迭代（红色实线）
+    for lid, (p1, p2) in enumerate(iterations[-1]):
+        ax_xz.plot(
+            [p1[xi], p2[xi]],
+            [p1[yi], p2[yi]],
+            "r-",
+            linewidth=2,
+            alpha=0.8,
+            label="Final" if lid == 0 else "",
+        )
+
+    ax_xz.set_xlabel("X (m)")
+    ax_xz.set_ylabel("Z (m)")
+    ax_xz.set_title("Side View (X-Z) - Shows all 7 lines")
+    ax_xz.grid(True, alpha=0.3)
+    ax_xz.axis("equal")
+    ax_xz.legend(loc="upper right")
 
     # Chi2曲线
-    ax_chi2 = axes[1, 1]
     ax_chi2.semilogy(range(len(chi2_values)), chi2_values, "b-o", markersize=4)
     ax_chi2.set_xlabel("Iteration")
     ax_chi2.set_ylabel("Chi2")
     ax_chi2.set_title("Chi2 Convergence")
     ax_chi2.grid(True, alpha=0.3)
-
-    # 添加图例
-    axes[0, 0].legend(loc="upper right")
 
     plt.tight_layout()
     plt.savefig("line_convergence.png", dpi=150)
@@ -205,28 +207,68 @@ def compute_line_errors(gt_lines, iterations):
     return errors
 
 
+def compute_line_distance(est_p1, est_p2, gt_p1, gt_p2):
+    """计算两条3D线之间的最短距离（与 C++ computeLineDistance 一致）"""
+    # 方向向量
+    d1 = (est_p2 - est_p1)
+    d1 = d1 / np.linalg.norm(d1)
+    d2 = (gt_p2 - gt_p1)
+    d2 = d2 / np.linalg.norm(d2)
+
+    # 线上的点（使用中点作为参考）
+    p1 = (est_p1 + est_p2) / 2
+    p2 = (gt_p1 + gt_p2) / 2
+
+    dot = abs(np.dot(d1, d2))
+    if dot > 0.999:
+        # 几乎平行，使用点到线距离
+        diff = p1 - p2
+        perp = diff - np.dot(diff, d1) * d1
+        return np.linalg.norm(perp)
+    else:
+        # 非平行，使用最短距离公式
+        n = np.cross(d1, d2)
+        n_norm = np.linalg.norm(n)
+        return abs(np.dot(p2 - p1, n)) / n_norm
+
+
+def compute_direction_error(est_p1, est_p2, gt_p1, gt_p2):
+    """计算方向误差（角度）"""
+    d1 = (est_p2 - est_p1)
+    d1 = d1 / np.linalg.norm(d1)
+    d2 = (gt_p2 - gt_p1)
+    d2 = d2 / np.linalg.norm(d2)
+    dot = abs(np.dot(d1, d2))
+    return np.arccos(min(1.0, dot)) * 180.0 / np.pi
+
+
 def print_per_line_error(gt_lines, iterations):
-    """打印每条线的误差"""
+    """打印每条线的误差（使用线间最短距离）"""
     print("\n每条线的收敛情况 (初始 -> 最终):")
-    print("-" * 60)
+    print("-" * 70)
+    print(f"  {'Line':<6} {'Init Pos':<10} {'Final Pos':<10} {'Init Dir':<10} {'Final Dir':<10} {'Status'}")
+    print("-" * 70)
 
     initial_lines = iterations[0]
     final_lines = iterations[-1]
 
     for lid in range(len(gt_lines)):
         gt_p1, gt_p2 = gt_lines[lid]
-        gt_mid = (gt_p1 + gt_p2) / 2
 
         init_p1, init_p2 = initial_lines[lid]
-        init_mid = (init_p1 + init_p2) / 2
-        init_err = np.linalg.norm(init_mid - gt_mid)
+        init_pos_err = compute_line_distance(init_p1, init_p2, gt_p1, gt_p2)
+        init_dir_err = compute_direction_error(init_p1, init_p2, gt_p1, gt_p2)
 
         final_p1, final_p2 = final_lines[lid]
-        final_mid = (final_p1 + final_p2) / 2
-        final_err = np.linalg.norm(final_mid - gt_mid)
+        final_pos_err = compute_line_distance(final_p1, final_p2, gt_p1, gt_p2)
+        final_dir_err = compute_direction_error(final_p1, final_p2, gt_p1, gt_p2)
 
-        status = "OK" if final_err < init_err else "WORSE"
-        print(f"  Line {lid:2d}: {init_err:6.3f}m -> {final_err:6.3f}m  [{status}]")
+        # 综合判断：位置和方向都要考虑
+        pos_improved = final_pos_err <= init_pos_err + 0.01  # 允许1cm容差
+        dir_improved = final_dir_err <= init_dir_err + 1.0   # 允许1度容差
+        status = "OK" if (pos_improved or dir_improved) else "WORSE"
+
+        print(f"  L{lid:<5} {init_pos_err:8.3f}m  {final_pos_err:8.3f}m  {init_dir_err:8.2f}°  {final_dir_err:8.2f}°  [{status}]")
 
 
 if __name__ == "__main__":

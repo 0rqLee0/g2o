@@ -139,6 +139,11 @@ void EdgeSE3Line3DProjection::computeError() {
   double sign = (dot >= 0) ? 1.0 : -1.0;
   _error(1) = rho_pred - sign * rho_obs;
 
+  // 限制误差大小，防止发散
+  const double max_error = 10.0;
+  if (std::abs(_error(0)) > max_error) _error(0) = max_error * ((_error(0) > 0) ? 1 : -1);
+  if (std::abs(_error(1)) > max_error) _error(1) = max_error * ((_error(1) > 0) ? 1 : -1);
+
   if (!std::isfinite(_error(0))) _error(0) = 0.0;
   if (!std::isfinite(_error(1))) _error(1) = 0.0;
 }
@@ -209,6 +214,7 @@ void EdgeSE3Line3DProjection::linearizeOplus() {
 }
 #endif
 
+#if 1
 // ============================================================================
 // Analytical Jacobian computation (two-point projection)
 // ============================================================================
@@ -425,6 +431,7 @@ void EdgeSE3Line3DProjection::linearizeOplus() {
     }
   }
 }
+#endif
 
 // ============================================================================
 // I/O
