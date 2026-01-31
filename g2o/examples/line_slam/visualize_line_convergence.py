@@ -208,16 +208,19 @@ def compute_line_errors(gt_lines, iterations):
 
 
 def compute_line_distance(est_p1, est_p2, gt_p1, gt_p2):
-    """计算两条3D线之间的最短距离（与 C++ computeLineDistance 一致）"""
-    # 方向向量
+    """计算两条3D线之间的最短距离
+    使用线上距原点最近的点来计算
+    """
+    # 方向向量（归一化）
     d1 = (est_p2 - est_p1)
     d1 = d1 / np.linalg.norm(d1)
     d2 = (gt_p2 - gt_p1)
     d2 = d2 / np.linalg.norm(d2)
 
-    # 线上的点（使用中点作为参考）
-    p1 = (est_p1 + est_p2) / 2
-    p2 = (gt_p1 + gt_p2) / 2
+    # 计算线上距原点最近的点（与 C++ 的 d.cross(w) 等价）
+    # 对于线 P = p + t*d，距原点最近的点是 p - (p·d)*d
+    p1 = est_p1 - np.dot(est_p1, d1) * d1
+    p2 = gt_p1 - np.dot(gt_p1, d2) * d2
 
     dot = abs(np.dot(d1, d2))
     if dot > 0.999:

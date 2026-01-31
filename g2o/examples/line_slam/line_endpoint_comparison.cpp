@@ -188,8 +188,8 @@ struct SceneData {
   void generateScene(bool debug = false) {
     // 世界坐标系: X朝前, Y向左, Z向上
 
-    // 斜线 
-    lines.push_back({Vector3d(2.0, -0.2, 0.3), Vector3d(2.5, 0.2, 0.9)});
+    // 斜线：位于相机正前方，始终可见
+    lines.push_back({Vector3d(3.0, -0.3, 0.2), Vector3d(3.5, 0.3, 0.8)});
 
     generateTrajectory();
     generateNoises();
@@ -222,6 +222,8 @@ struct SceneData {
 
  private:
   void generateTrajectory() {
+    // 相机初始朝向：光轴指向世界+X方向
+    // 线在正前方 X=3~3.5m 处
     Matrix3d R_wc;
     R_wc.col(0) = Vector3d(0, -1, 0);  // 相机X -> 世界-Y
     R_wc.col(1) = Vector3d(0, 0, -1);  // 相机Y -> 世界-Z
@@ -232,38 +234,54 @@ struct SceneData {
     pose.translation() = Vector3d(0, 0, 0.5);
     poses.push_back(pose);
 
-    // 前进运动 - 减小旋转幅度以保持线在视野中
-    for (int i = 0; i < 30; ++i) {
-      Isometry3d delta = Isometry3d::Identity();
-      delta.translation() = Vector3d(0.05, 0, 0.02 * cos(i * 0.4));  // 减小平移
-      delta.matrix().block<3, 3>(0, 0) =
-          (AngleAxisd(0.03 * sin(i * 0.3), Vector3d::UnitZ()) *  // 减小旋转
-           AngleAxisd(0.02 * sin(i * 0.25), Vector3d::UnitY()))
-              .toRotationMatrix();
-      pose = pose * delta;
-      poses.push_back(pose);
-    }
-
-    // 返回运动
-    for (int i = 0; i < 30; ++i) {
-      Isometry3d delta = Isometry3d::Identity();
-      delta.translation() = Vector3d(-0.05, 0, -0.02 * cos(i * 0.5));
-      delta.matrix().block<3, 3>(0, 0) =
-          (AngleAxisd(-0.03 * sin(i * 0.3), Vector3d::UnitZ()) *
-           AngleAxisd(-0.02 * sin(i * 0.2), Vector3d::UnitY()))
-              .toRotationMatrix();
-      pose = pose * delta;
-      poses.push_back(pose);
-    }
-
-    // 侧向运动 - 减小幅度
+    // 阶段1：大幅左右平移 - 20帧（总共左右移动约1m）
     for (int i = 0; i < 20; ++i) {
-      double lateral = (i < 10) ? 0.05 : -0.05;
       Isometry3d delta = Isometry3d::Identity();
-      delta.translation() = Vector3d(0.02, lateral, 0);
-      delta.matrix().block<3, 3>(0, 0) =
-          AngleAxisd(0.02 * ((i < 10) ? 1 : -1), Vector3d::UnitZ())
-              .toRotationMatrix();
+      double lateral = 0.1 * sin(i * M_PI / 10);  // 左右大幅摆动
+      delta.translation() = Vector3d(0, lateral, 0);
+      pose = pose * delta;
+      poses.push_back(pose);
+    }
+
+    // 阶段2：大幅上下平移 - 20帧
+    for (int i = 0; i < 20; ++i) {
+      Isometry3d delta = Isometry3d::Identity();
+      double vertical = 0.08 * sin(i * M_PI / 10);  // 上下大幅摆动
+      delta.translation() = Vector3d(0, 0, vertical);
+      pose = pose * delta;
+      poses.push_back(pose);
+    }
+
+    // 阶段3：前进靠近线 - 20帧（靠近约1m）
+    for (int i = 0; i < 20; ++i) {
+      Isometry3d delta = Isometry3d::Identity();
+      delta.translation() = Vector3d(0.05, 0, 0);  // 持续前进
+      pose = pose * delta;
+      poses.push_back(pose);
+    }
+
+    // 阶段4：在靠近位置左右平移 - 20帧
+    for (int i = 0; i < 20; ++i) {
+      Isometry3d delta = Isometry3d::Identity();
+      double lateral = 0.08 * sin(i * M_PI / 10);
+      delta.translation() = Vector3d(0, lateral, 0);
+      pose = pose * delta;
+      poses.push_back(pose);
+    }
+
+    // 阶段5：后退远离线 - 20帧
+    for (int i = 0; i < 20; ++i) {
+      Isometry3d delta = Isometry3d::Identity();
+      delta.translation() = Vector3d(-0.05, 0, 0);  // 持续后退
+      pose = pose * delta;
+      poses.push_back(pose);
+    }
+
+    // 阶段6：斜向运动（同时平移和小幅旋转）- 20帧
+    for (int i = 0; i < 20; ++i) {
+      Isometry3d delta = Isometry3d::Identity();
+      delta.translation() = Vector3d(0.03, 0.05 * sin(i * M_PI / 10),
+                                     0.03 * cos(i * M_PI / 10));
       pose = pose * delta;
       poses.push_back(pose);
     }
@@ -275,18 +293,9 @@ struct SceneData {
     double pixel_noise = 10.0;        // 像素噪声
     double rho_threshold = 10.0;
 
-    // 只有第20-60个位姿能观测到线
-    int obs_start = 20;
-    int obs_end = 60;
-
-    int reject_depth = 0, reject_fov = 0, reject_rho = 0, reject_range = 0;
+    int reject_depth = 0, reject_fov = 0, reject_rho = 0;
 
     for (size_t pose_id = 0; pose_id < poses.size(); ++pose_id) {
-      // 限制观测范围：只有 pose 20-60 能看到线
-      if (pose_id < obs_start || pose_id > obs_end) {
-        reject_range++;
-        continue;
-      }
       // poses[i] 存储的是相机在世界中的位姿 T_wc
       // T_wc 将相机系坐标变换到世界系: p_w = T_wc * p_c
       // 要把世界点变换到相机系，需要 T_cw = T_wc^(-1)
@@ -382,7 +391,8 @@ struct SceneData {
 
     if (debug) {
       cout << "  [调试] 拒绝统计: 深度=" << reject_depth
-           << ", FOV=" << reject_fov << ", rho=" << reject_rho << endl;
+           << ", FOV=" << reject_fov << ", rho=" << reject_rho
+           << ", 有效观测=" << observations.size() << endl;
     }
   }
 };
