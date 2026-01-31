@@ -133,6 +133,128 @@ class EdgeEndpointToLine2D : public BaseMultiEdge<2, Vector4d> {
     return writeInformationMatrix(os);
   }
 
+  // 解析雅可比矩阵（参考 PL-VINS）
+  // 暂时注释掉，使用 g2o 默认数值求导来验证 computeError
+  void linearizeOplus_DISABLED() {
+    const VertexPointXYZ* vp1 =
+        static_cast<const VertexPointXYZ*>(_vertices[0]);
+    const VertexPointXYZ* vp2 =
+        static_cast<const VertexPointXYZ*>(_vertices[1]);
+    const VertexSE3Expmap* vpose =
+        static_cast<const VertexSE3Expmap*>(_vertices[2]);
+
+    // 3D端点（世界坐标系）
+    Vector3d P1_w = vp1->estimate();
+    Vector3d P2_w = vp2->estimate();
+
+    // 变换到相机坐标系
+    SE3Quat T_cw = vpose->estimate();
+    Vector3d P1_c = T_cw.map(P1_w);
+    Vector3d P2_c = T_cw.map(P2_w);
+
+    double X1 = P1_c.x(), Y1 = P1_c.y(), Z1 = P1_c.z();
+    double X2 = P2_c.x(), Y2 = P2_c.y(), Z2 = P2_c.z();
+
+    // 归一化坐标
+    double u0 = X1 / Z1, v0 = Y1 / Z1;
+    double u1 = X2 / Z2, v1 = Y2 / Z2;
+
+    // 2D直线参数: l = (n1, n2, rho)，直线方程 n1*x + n2*y + rho = 0
+    double n1 = v0 - v1;
+    double n2 = u1 - u0;
+    double rho = u0 * v1 - u1 * v0;
+
+    double l_norm = n1 * n1 + n2 * n2;
+    double l_sqrtnorm = sqrt(l_norm);
+    double l_trinorm = l_norm * l_sqrtnorm;
+
+    if (l_sqrtnorm < 1e-6) {
+      _jacobianOplus[0].setZero();
+      _jacobianOplus[1].setZero();
+      _jacobianOplus[2].setZero();
+      return;
+    }
+
+    // 观测点的归一化坐标
+    double obs_x1 = (_measurement(0) - cx) / fx;
+    double obs_y1 = (_measurement(1) - cy) / fy;
+    double obs_x2 = (_measurement(2) - cx) / fx;
+    double obs_y2 = (_measurement(3) - cy) / fy;
+
+    // 未归一化的误差
+    double e1_raw = n1 * obs_x1 + n2 * obs_y1 + rho;
+    double e2_raw = n1 * obs_x2 + n2 * obs_y2 + rho;
+
+    // 误差对2D线参数 (n1, n2, rho) 的雅可比 (参考 PL-VINS)
+    Eigen::Matrix<double, 2, 3> jaco_e_l;
+    jaco_e_l << (obs_x1 / l_sqrtnorm - n1 * e1_raw / l_trinorm),
+        (obs_y1 / l_sqrtnorm - n2 * e1_raw / l_trinorm), (1.0 / l_sqrtnorm),
+        (obs_x2 / l_sqrtnorm - n1 * e2_raw / l_trinorm),
+        (obs_y2 / l_sqrtnorm - n2 * e2_raw / l_trinorm), (1.0 / l_sqrtnorm);
+
+    // 2D线参数对归一化坐标 (u0, v0, u1, v1) 的雅可比
+    // n1 = v0 - v1, n2 = u1 - u0, rho = u0*v1 - u1*v0
+    Eigen::Matrix<double, 3, 4> jaco_l_uv;
+    jaco_l_uv << 0, 1, 0, -1,      // dn1/d(u0,v0,u1,v1)
+        -1, 0, 1, 0,               // dn2/d(u0,v0,u1,v1)
+        v1, -u1, -v0, u0;          // drho/d(u0,v0,u1,v1)
+
+    // 归一化坐标对相机坐标的雅可比
+    // u = X/Z, v = Y/Z
+    double invZ1 = 1.0 / Z1, invZ1_2 = invZ1 * invZ1;
+    double invZ2 = 1.0 / Z2, invZ2_2 = invZ2 * invZ2;
+
+    Eigen::Matrix<double, 2, 3> jaco_uv1_Pc1;
+    jaco_uv1_Pc1 << invZ1, 0, -X1 * invZ1_2, 0, invZ1, -Y1 * invZ1_2;
+
+    Eigen::Matrix<double, 2, 3> jaco_uv2_Pc2;
+    jaco_uv2_Pc2 << invZ2, 0, -X2 * invZ2_2, 0, invZ2, -Y2 * invZ2_2;
+
+    // 组合: (u0,v0,u1,v1) 对 (Pc1, Pc2) 的雅可比
+    Eigen::Matrix<double, 4, 6> jaco_uv_Pc;
+    jaco_uv_Pc.setZero();
+    jaco_uv_Pc.block<2, 3>(0, 0) = jaco_uv1_Pc1;  // (u0,v0) 对 Pc1
+    jaco_uv_Pc.block<2, 3>(2, 3) = jaco_uv2_Pc2;  // (u1,v1) 对 Pc2
+
+    // 误差对相机坐标的雅可比
+    Eigen::Matrix<double, 2, 6> jaco_e_Pc = jaco_e_l * jaco_l_uv * jaco_uv_Pc;
+
+    // 相机坐标对世界坐标的雅可比: Pc = R * Pw + t => dPc/dPw = R
+    Matrix3d R = T_cw.rotation().toRotationMatrix();
+
+    // 雅可比对端点1 (Pw1)
+    _jacobianOplus[0] = jaco_e_Pc.block<2, 3>(0, 0) * R;
+
+    // 雅可比对端点2 (Pw2)
+    _jacobianOplus[1] = jaco_e_Pc.block<2, 3>(0, 3) * R;
+
+    // 雅可比对位姿 (SE3)
+    // g2o SE3Expmap 使用左乘: T_new = exp(delta) * T_old
+    // delta = (omega[0:3], upsilon[3:6])，omega是旋转，upsilon是平移
+    // Pc_new = exp(delta) * Pc = (I + [omega]_x) * Pc + upsilon
+    //        = Pc + omega × Pc + upsilon = Pc - Pc × omega + upsilon
+    // dPc/d(omega) = -skew(Pc), dPc/d(upsilon) = I
+    Eigen::Matrix<double, 3, 6> jaco_Pc1_pose, jaco_Pc2_pose;
+    jaco_Pc1_pose.block<3, 3>(0, 0) = -skew(P1_c);           // d/d(omega)
+    jaco_Pc1_pose.block<3, 3>(0, 3) = Matrix3d::Identity();  // d/d(upsilon)
+    jaco_Pc2_pose.block<3, 3>(0, 0) = -skew(P2_c);
+    jaco_Pc2_pose.block<3, 3>(0, 3) = Matrix3d::Identity();
+
+    // 组合
+    Eigen::Matrix<double, 6, 6> jaco_Pc_pose;
+    jaco_Pc_pose.block<3, 6>(0, 0) = jaco_Pc1_pose;
+    jaco_Pc_pose.block<3, 6>(3, 0) = jaco_Pc2_pose;
+
+    _jacobianOplus[2] = jaco_e_Pc * jaco_Pc_pose;
+  }
+
+  // 反对称矩阵
+  static Matrix3d skew(const Vector3d& v) {
+    Matrix3d m;
+    m << 0, -v.z(), v.y(), v.z(), 0, -v.x(), -v.y(), v.x(), 0;
+    return m;
+  }
+
   double fx, fy, cx, cy;  // 相机内参
 };
 
@@ -631,16 +753,27 @@ ExperimentResult runPluckerMethod(SceneData& data, int maxIter, bool verbose,
   vector<vector<pair<Vector3d, Vector3d>>> line_history;
   vector<double> chi2_history;
 
+  // 记录初始状态时使用带噪声的端点，保持与端点方法一致
+  bool first_record = true;
   auto recordCurrentLines = [&]() {
     vector<pair<Vector3d, Vector3d>> current_lines;
     for (size_t i = 0; i < data.lines.size(); ++i) {
-      Line3D L = line_vertices[i]->estimate();
-      double gt_length = (data.lines[i].second - data.lines[i].first).norm();
-      Vector3d gt_mid = (data.lines[i].first + data.lines[i].second) / 2.0;
-      current_lines.push_back(line3dToEndpoints(L, gt_length / 2.0, gt_mid));
+      if (first_record) {
+        // ITER 0: 直接使用带噪声的初始端点，保持与端点方法一致
+        current_lines.push_back(data.lines_noisy[i]);
+      } else {
+        // 后续迭代: 从 Plücker 线转换
+        Line3D L = line_vertices[i]->estimate();
+        double gt_length = (data.lines[i].second - data.lines[i].first).norm();
+        Vector3d noisy_mid =
+            (data.lines_noisy[i].first + data.lines_noisy[i].second) / 2.0;
+        current_lines.push_back(
+            line3dToEndpoints(L, gt_length / 2.0, noisy_mid));
+      }
     }
     line_history.push_back(current_lines);
     chi2_history.push_back(optimizer.chi2());
+    first_record = false;
   };
 
   optimizer.setVerbose(verbose);
@@ -711,7 +844,8 @@ ExperimentResult runPluckerMethod(SceneData& data, int maxIter, bool verbose,
 // ============================================================================
 // 方案B: 端点 + 点投影
 // ============================================================================
-ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose) {
+ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose,
+                                   bool saveHistory = false) {
   auto start_time = chrono::high_resolution_clock::now();
 
   SparseOptimizer optimizer;
@@ -752,31 +886,8 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose) {
     pose_vertices[i] = v;
   }
 
-  // 添加里程计边 (EdgeSE3Expmap)
-  for (size_t i = 1; i < data.poses.size(); ++i) {
-    // delta_wc = T_wc_{i-1}^{-1} * T_wc_i
-    Isometry3d delta_wc = data.poses[i - 1].inverse() * data.poses[i];
-    // 使用与方案A相同的预生成噪声
-    Isometry3d delta_wc_noisy = delta_wc * data.odom_noises[i - 1];
-
-    // 对于 SE3Quat: delta_cw = delta_wc^{-1}
-    // 但 EdgeSE3Expmap 的测量是从 vertex[0] 到 vertex[1] 的相对变换
-    // 所以测量值应该是 T_cw_i * T_wc_{i-1} = T_cw_i * T_cw_{i-1}^{-1}
-    // 这等于 (T_wc_{i-1}^{-1} * T_wc_i)^{-1} = delta_wc^{-1}
-    Isometry3d meas_iso = delta_wc_noisy.inverse();
-
-    EdgeSE3Expmap* e = new EdgeSE3Expmap();
-    e->vertices()[0] = pose_vertices[i - 1];
-    e->vertices()[1] = pose_vertices[i];
-    e->setMeasurement(SE3Quat(meas_iso.rotation(), meas_iso.translation()));
-
-    Matrix6 info = Matrix6::Identity();
-    for (int j = 0; j < 6; ++j) {
-      info(j, j) = 1.0 / (data.odom_noise_sigma(j) * data.odom_noise_sigma(j));
-    }
-    e->setInformation(info);
-    optimizer.addEdge(e);
-  }
+  // 注意：位姿已全部固定，不需要添加位姿边
+  // 位姿边只在位姿可优化时才有意义
 
   // 添加端点顶点
   map<int, pair<VertexPointXYZ*, VertexPointXYZ*>> endpoint_vertices;
@@ -839,15 +950,41 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose) {
   optimizer.computeActiveErrors();
   double chi2_before = optimizer.chi2();
 
+  // 收敛历史记录
+  vector<vector<pair<Vector3d, Vector3d>>> line_history;
+  vector<double> chi2_history;
+
+  auto recordCurrentEndpoints = [&]() {
+    vector<pair<Vector3d, Vector3d>> current_lines;
+    for (size_t i = 0; i < data.lines.size(); ++i) {
+      Vector3d p1 = endpoint_vertices[i].first->estimate();
+      Vector3d p2 = endpoint_vertices[i].second->estimate();
+      current_lines.emplace_back(p1, p2);
+    }
+    line_history.push_back(current_lines);
+    chi2_history.push_back(optimizer.chi2());
+  };
+
   optimizer.setVerbose(verbose);
-  int iterations = optimizer.optimize(maxIter);
+
+  int iterations = 0;
+  if (saveHistory) {
+    // 单步迭代模式：记录每次迭代
+    recordCurrentEndpoints();  // 记录初始状态
+    for (int iter = 0; iter < maxIter; ++iter) {
+      int ret = optimizer.optimize(1);
+      if (ret <= 0) break;
+      iterations++;
+      optimizer.computeActiveErrors();
+      recordCurrentEndpoints();
+    }
+  } else {
+    // 正常模式：一次性优化
+    iterations = optimizer.optimize(maxIter);
+  }
 
   optimizer.computeActiveErrors();
   double chi2_after = optimizer.chi2();
-
-  auto end_time = chrono::high_resolution_clock::now();
-  double time_ms =
-      chrono::duration<double, milli>(end_time - start_time).count();
 
   // 计算端点误差
   double total_endpoint_error = 0;
@@ -869,6 +1006,16 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose) {
     }
     cout << endl;
   }
+
+  // 保存收敛历史
+  if (saveHistory) {
+    saveLineConvergenceHistory("line_convergence_endpoint.txt", data.lines,
+                               line_history, chi2_history);
+  }
+
+  auto end_time = chrono::high_resolution_clock::now();
+  double time_ms =
+      chrono::duration<double, milli>(end_time - start_time).count();
 
   ExperimentResult result;
   result.method_name = "端点+点到线距离";
@@ -992,13 +1139,15 @@ int main(int argc, char** argv) {
 
     // 运行方案B
     cout << "\n运行方案B: 端点 + 点投影..." << endl;
-    results.push_back(runEndpointMethod(data, maxIterations, verbose));
+    results.push_back(
+        runEndpointMethod(data, maxIterations, verbose, saveConvergence));
 
     // 打印对比结果
     printComparisonTable(results);
   } else if (useEndpoint) {
     cout << "\n运行方案B: 端点 + 点投影..." << endl;
-    results.push_back(runEndpointMethod(data, maxIterations, verbose));
+    results.push_back(
+        runEndpointMethod(data, maxIterations, verbose, saveConvergence));
     printComparisonTable(results);
   } else {
     cout << "\n运行方案A: Plücker + 线投影..." << endl;

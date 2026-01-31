@@ -72,7 +72,7 @@ def parse_convergence_file(filename):
     return gt_lines, iterations, chi2_values
 
 
-def visualize_convergence_2d(gt_lines, iterations, chi2_values):
+def visualize_convergence_2d(gt_lines, iterations, chi2_values, output_name=None):
     """2D可视化收敛过程（X-Z侧视图 + Chi2曲线）"""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -134,8 +134,10 @@ def visualize_convergence_2d(gt_lines, iterations, chi2_values):
     ax_chi2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("line_convergence.png", dpi=150)
-    print("图像已保存到 line_convergence.png")
+    if output_name is None:
+        output_name = "line_convergence.png"
+    plt.savefig(output_name, dpi=150)
+    print(f"图像已保存到 {output_name}")
     plt.show()
 
 
@@ -305,7 +307,12 @@ if __name__ == "__main__":
     except:
         choice = "1"
 
+    # 根据输入文件名生成输出文件名
+    import os
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    output_png = f"{base_name}.png"
+
     if choice == "2":
         visualize_with_slider_2d(gt_lines, iterations, chi2_values)
     else:
-        visualize_convergence_2d(gt_lines, iterations, chi2_values)
+        visualize_convergence_2d(gt_lines, iterations, chi2_values, output_png)
