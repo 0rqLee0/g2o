@@ -496,16 +496,31 @@ struct SceneData {
         obs.pose_id = pose_id;
         obs.line_id = line_id;
 
-        // Plücker观测 (添加噪声)
-        Vector2d noise_line = sample_noise_from_line2d(line_noise);
-        obs.line2d =
-            Line2D(theta_true + noise_line(0), rho_true + noise_line(1));
-
         // 端点观测 (添加噪声)
         obs.pixel1 = pixel1 + Vector2d(Sampler::gaussRand(0, pixel_noise),
                                        Sampler::gaussRand(0, pixel_noise));
         obs.pixel2 = pixel2 + Vector2d(Sampler::gaussRand(0, pixel_noise),
                                        Sampler::gaussRand(0, pixel_noise));
+
+        // Plücker观测：从带噪声的端点像素转换到归一化平面，计算 (θ, ρ)
+        // 这样两种方法使用相同的观测噪声
+        double u0_noisy = (obs.pixel1.x() - cx) / fx;
+        double v0_noisy = (obs.pixel1.y() - cy) / fy;
+        double u1_noisy = (obs.pixel2.x() - cx) / fx;
+        double v1_noisy = (obs.pixel2.y() - cy) / fy;
+
+        double n1_noisy = v0_noisy - v1_noisy;
+        double n2_noisy = u1_noisy - u0_noisy;
+        double rho_noisy = u0_noisy * v1_noisy - u1_noisy * v0_noisy;
+        double norm_noisy = sqrt(n1_noisy * n1_noisy + n2_noisy * n2_noisy);
+        if (norm_noisy > 1e-6) {
+          double theta_noisy =
+              atan2(n2_noisy / norm_noisy, n1_noisy / norm_noisy);
+          double rho_noisy_norm = rho_noisy / norm_noisy;
+          obs.line2d = Line2D(theta_noisy, rho_noisy_norm);
+        } else {
+          obs.line2d = Line2D(theta_true, rho_true);
+        }
 
         observations.push_back(obs);
       }
@@ -653,23 +668,6 @@ ExperimentResult runPluckerMethod(SceneData& data, int maxIter, bool verbose,
     pose_vertices[i] = v;
   }
 
-  // 添加里程计边
-  for (size_t i = 1; i < data.poses.size(); ++i) {
-    Isometry3d delta = data.poses[i - 1].inverse() * data.poses[i];
-
-    EdgeSE3* e = new EdgeSE3();
-    e->vertices()[0] = pose_vertices[i - 1];
-    e->vertices()[1] = pose_vertices[i];
-    e->setMeasurement(delta * data.odom_noises[i - 1]);
-
-    Matrix6 info = Matrix6::Identity();
-    for (int j = 0; j < 6; ++j) {
-      info(j, j) = 1.0 / (data.odom_noise_sigma(j) * data.odom_noise_sigma(j));
-    }
-    e->setInformation(info);
-    optimizer.addEdge(e);
-  }
-
   // 添加线顶点（使用切空间参数化，与端点方法使用相同的初始化噪声）
   map<int, VertexLine3DTangent*> line_vertices;
 
@@ -705,15 +703,16 @@ ExperimentResult runPluckerMethod(SceneData& data, int maxIter, bool verbose,
     e->vertices()[1] = line_vertices[obs.line_id];
     e->setMeasurement(obs.line2d);
 
-    // 信息矩阵: 1 / sigma^2, sigma = 0.02
+    // 信息矩阵: 使用合理的权重
+    // theta 误差单位是弧度，rho 误差单位是归一化坐标
     Matrix2d info = Matrix2d::Zero();
-    info(0, 0) = 1.0 / (0.02 * 0.02);  // theta: 2500
-    info(1, 1) = 1.0 / (0.02 * 0.02);  // rho: 2500
+    info(0, 0) = 100.0;  // theta 权重
+    info(1, 1) = 100.0;  // rho 权重
     e->setInformation(info);
 
     // 使用 Huber 核函数
     RobustKernelHuber* rk = new RobustKernelHuber;
-    rk->setDelta(1.0);
+    rk->setDelta(0.05);  // 约 2.5 sigma
     e->setRobustKernel(rk);
 
     optimizer.addEdge(e);
@@ -800,10 +799,12 @@ ExperimentResult runPluckerMethod(SceneData& data, int maxIter, bool verbose,
   // 打印线的最终状态
   cout << "\n线的最终状态 vs 真值（使用正确的线距离度量）:" << endl;
   double total_line_error = 0;
+  double total_dir_error = 0;
   for (size_t i = 0; i < data.lines.size(); ++i) {
     Line3D L = line_vertices[i]->estimate();
     auto [dir_err, pos_err] = computeLineDistance(gt_lines_plucker[i], L);
     total_line_error += pos_err;
+    total_dir_error += dir_err;
     cout << "  线 " << i << ": 方向误差=" << dir_err << "度, 位置误差=" << pos_err << "m";
     if (pos_err < 0.1 && dir_err < 5.0) {
       cout << " [收敛]";
@@ -831,8 +832,8 @@ ExperimentResult runPluckerMethod(SceneData& data, int maxIter, bool verbose,
   result.method_name = "Plücker+线投影";
   result.chi2_before = chi2_before;
   result.chi2_after = chi2_after;
-  result.avg_trans_error = total_line_error / data.lines.size();  // 用线误差代替
-  result.avg_rot_error = 0;
+  result.avg_trans_error = total_line_error / data.lines.size();
+  result.avg_rot_error = total_dir_error / data.lines.size();  // 方向误差（度）
   result.num_features = data.lines.size();
   result.num_observations = data.observations.size();
   result.computation_time_ms = time_ms;
@@ -986,20 +987,36 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose,
   optimizer.computeActiveErrors();
   double chi2_after = optimizer.chi2();
 
-  // 计算端点误差
-  double total_endpoint_error = 0;
-  cout << "\n端点的最终状态 vs 真值:" << endl;
+  // 计算线误差（使用与普吕克方法相同的度量）
+  double total_line_error = 0;
+  double total_dir_error = 0;
+  cout << "\n端点的最终状态 vs 真值（使用线距离度量）:" << endl;
   for (size_t i = 0; i < data.lines.size(); ++i) {
     Vector3d p1_est = endpoint_vertices[i].first->estimate();
     Vector3d p2_est = endpoint_vertices[i].second->estimate();
 
-    double err1 = (data.lines[i].first - p1_est).norm();
-    double err2 = (data.lines[i].second - p2_est).norm();
-    double avg_err = (err1 + err2) / 2.0;
-    total_endpoint_error += avg_err;
+    // 将估计的端点转换为 Plücker 线
+    Vector3d dir_est = (p2_est - p1_est).normalized();
+    Vector3d mid_est = (p1_est + p2_est) / 2.0;
+    Vector6 cartesian_est;
+    cartesian_est << mid_est, dir_est;
+    Line3D L_est = Line3D::fromCartesian(cartesian_est);
 
-    cout << "  线 " << i << ": 端点1误差=" << err1 << "m, 端点2误差=" << err2 << "m";
-    if (avg_err < 0.1) {
+    // 将真值端点转换为 Plücker 线
+    Vector3d dir_gt = (data.lines[i].second - data.lines[i].first).normalized();
+    Vector3d mid_gt = (data.lines[i].first + data.lines[i].second) / 2.0;
+    Vector6 cartesian_gt;
+    cartesian_gt << mid_gt, dir_gt;
+    Line3D L_gt = Line3D::fromCartesian(cartesian_gt);
+
+    // 使用与普吕克方法相同的线距离度量
+    auto [dir_err, pos_err] = computeLineDistance(L_gt, L_est);
+    total_line_error += pos_err;
+    total_dir_error += dir_err;
+
+    cout << "  线 " << i << ": 方向误差=" << dir_err << "度, 位置误差=" << pos_err
+         << "m";
+    if (pos_err < 0.1 && dir_err < 5.0) {
       cout << " [收敛]";
     } else {
       cout << " [未收敛]";
@@ -1021,9 +1038,9 @@ ExperimentResult runEndpointMethod(SceneData& data, int maxIter, bool verbose,
   result.method_name = "端点+点到线距离";
   result.chi2_before = chi2_before;
   result.chi2_after = chi2_after;
-  result.avg_trans_error = total_endpoint_error / data.lines.size();  // 用端点误差
-  result.avg_rot_error = 0;
-  result.avg_line_error = total_endpoint_error / data.lines.size();
+  result.avg_trans_error = total_line_error / data.lines.size();  // 使用线距离度量
+  result.avg_rot_error = total_dir_error / data.lines.size();  // 方向误差（度）
+  result.avg_line_error = total_line_error / data.lines.size();
   result.num_features = data.lines.size() * 2;
   result.num_observations = data.observations.size();  // 每个观测2个约束
   result.computation_time_ms = time_ms;
@@ -1104,6 +1121,9 @@ void printComparisonTable(const vector<ExperimentResult>& results) {
 // 主函数
 // ============================================================================
 int main(int argc, char** argv) {
+  // 固定随机种子，确保每次运行数据一致
+  Sampler::seedRand(42);
+
   bool verbose = false;
   int maxIterations = 15;
   bool runBoth = true;
